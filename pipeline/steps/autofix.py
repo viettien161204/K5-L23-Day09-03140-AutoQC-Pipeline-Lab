@@ -34,6 +34,159 @@ import yaml  # noqa: F401
 from ..common import ERROR, parse_yolo_line  # noqa: F401
 
 
+DROP_CODES = {"BAD_FORMAT", "BAD_CLASS_ID", "BOX_ZERO", "DUP_BOX"}
+REMOVE_IMAGE_CODES = {"LEAK_TEST", "CORRUPT_IMAGE", "BAD_SIZE"}
+
+
+def _is_remove_image(code: str) -> bool:
+    return code in REMOVE_IMAGE_CODES or code.startswith("DUP_IMAGE_")
+
+
 def fix(ds, issues, cfg):
-    # TODO
-    raise NotImplementedError("autofix chưa làm")
+    errors = [i for i in issues if i.severity == ERROR]
+    if not errors:
+        return []
+
+    fixes = []
+    removed_stems = set()
+
+    # 1. Xoá ảnh + nhãn bị loại
+    for i in errors:
+        if _is_remove_image(i.code) and i.image not in removed_stems:
+            img_p = ds.image_path(i.image)
+            lbl_p = ds.label_path(i.image)
+            if (img_p and img_p.exists()) or lbl_p.exists():
+                if img_p and img_p.exists():
+                    img_p.unlink()
+                if lbl_p.exists():
+                    lbl_p.unlink()
+                removed_stems.add(i.image)
+                fixes.append(
+                    {
+                        "image": i.image,
+                        "line": "",
+                        "action": "remove_image",
+                        "before": i.image,
+                        "after": "(đã xoá)",
+                    }
+                )
+
+    # 2. Sửa data.yaml (chỉ làm một lần)
+    if any(i.code == "BAD_CLASS_NAME" for i in errors) and ds.yaml_path.exists():
+        data = yaml.safe_load(ds.yaml_path.read_text(encoding="utf-8")) or {}
+        before_names = str(data.get("names"))
+        new_names = list(cfg["classes"])
+        if data.get("names") != new_names:
+            data["names"] = new_names
+            if "nc" in data:
+                data["nc"] = len(new_names)
+            ds.yaml_path.write_text(
+                yaml.safe_dump(data, sort_keys=False, allow_unicode=True),
+                encoding="utf-8",
+            )
+            fixes.append(
+                {
+                    "image": "data.yaml",
+                    "line": "",
+                    "action": "rename_classes",
+                    "before": before_names,
+                    "after": str(new_names),
+                }
+            )
+
+    # 3. Ghi nhận ảnh thiếu file nhãn (không tạo file mới)
+    needs_label_seen = set()
+    for i in errors:
+        if i.code == "MISSING_LABEL_FILE" and i.image not in removed_stems and i.image not in needs_label_seen:
+            needs_label_seen.add(i.image)
+            fixes.append(
+                {
+                    "image": i.image,
+                    "line": "",
+                    "action": "needs_label",
+                    "before": "(không có file)",
+                    "after": "chuyển người gán",
+                }
+            )
+
+    # 4. Gom lỗi dòng theo file và sửa một lần mỗi file
+    by_file: dict[str, dict[int, set[str]]] = defaultdict(lambda: defaultdict(set))
+    for i in errors:
+        if i.image in removed_stems or i.line is None:
+            continue
+        if i.code in DROP_CODES or i.code == "BOX_OUT_OF_IMAGE":
+            by_file[i.image][i.line].add(i.code)
+
+    for stem, line_map in sorted(by_file.items()):
+        lp = ds.label_path(stem)
+        if not lp.exists():
+            continue
+        raw_lines = lp.read_text(encoding="utf-8", errors="replace").splitlines()
+        drop_indices = set()
+        new_lines = list(raw_lines)
+
+        for line_no, codes in sorted(line_map.items()):
+            idx = line_no - 1
+            if not (0 <= idx < len(raw_lines)):
+                continue
+            orig = raw_lines[idx]
+            if codes & DROP_CODES:
+                drop_indices.add(idx)
+                fixes.append(
+                    {
+                        "image": stem,
+                        "line": line_no,
+                        "action": "drop_line",
+                        "before": orig,
+                        "after": "(đã xoá)",
+                    }
+                )
+            elif "BOX_OUT_OF_IMAGE" in codes:
+                try:
+                    cls_id, cx, cy, w, h = parse_yolo_line(orig)
+                except ValueError:
+                    drop_indices.add(idx)
+                    fixes.append(
+                        {
+                            "image": stem,
+                            "line": line_no,
+                            "action": "drop_line",
+                            "before": orig,
+                            "after": "(đã xoá)",
+                        }
+                    )
+                    continue
+                x1 = max(0.0, cx - w / 2)
+                y1 = max(0.0, cy - h / 2)
+                x2 = min(1.0, cx + w / 2)
+                y2 = min(1.0, cy + h / 2)
+                nw, nh = x2 - x1, y2 - y1
+                if nw <= 0 or nh <= 0:
+                    drop_indices.add(idx)
+                    fixes.append(
+                        {
+                            "image": stem,
+                            "line": line_no,
+                            "action": "drop_line",
+                            "before": orig,
+                            "after": "(đã xoá: box ngoài ảnh)",
+                        }
+                    )
+                else:
+                    ncx, ncy = (x1 + x2) / 2, (y1 + y2) / 2
+                    updated = f"{cls_id} {ncx:.6f} {ncy:.6f} {nw:.6f} {nh:.6f}"
+                    new_lines[idx] = updated
+                    fixes.append(
+                        {
+                            "image": stem,
+                            "line": line_no,
+                            "action": "clip_box",
+                            "before": orig,
+                            "after": updated,
+                        }
+                    )
+
+        kept = [ln for idx, ln in enumerate(new_lines) if idx not in drop_indices]
+        lp.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+
+    return fixes
